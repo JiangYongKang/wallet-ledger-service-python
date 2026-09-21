@@ -9,3 +9,23 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+log_cli = false
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+# B008: FastAPI 在参数默认值中调用 Depends() 是官方推荐写法
+# BLE001: 并发测试中有意捕获所有异常以统计成败
+ignore = ["B008", "BLE001"]
