@@ -3,6 +3,8 @@
 - 扫描按区块高度（tip）单调推进；回退的 tip -> OutOfOrderError(422)，不静默。
 - 单批事件数受 max_batch_size 限制；整体受 RateLimiter 的吞吐/在途约束，
   处理积压或上游失败时按策略延迟（等待令牌）或拒绝（429，带 retry_after）。
+- 同一批允许混着多种资产的事件：资产由事件自然键解析，每条只落自己的资产
+  口径；限流按“事件数”计令牌，资产种类增多不会放大资源占用。
 - 同一批若 reorg_keys 与确认事件同时到达：先回撤后确认，结论确定可复现。
 - 所有下游变更由 LedgerService 的状态机幂等保证，重试不重复入账。
 """
@@ -109,9 +111,13 @@ class ConfirmationScanner:
             result = {
                 "status": "ok",
                 "tip_height": tip_height,
-                "reorged": [r.event.natural_key for r in reorged],
+                "reorged": [
+                    {"key": list(r.event.natural_key), "asset": r.event.asset}
+                    for r in reorged
+                ],
                 "affected": [
-                    {"key": list(r.event.natural_key), "status": r.status.value}
+                    {"key": list(r.event.natural_key),
+                     "asset": r.event.asset, "status": r.status.value}
                     for r in affected
                 ],
             }

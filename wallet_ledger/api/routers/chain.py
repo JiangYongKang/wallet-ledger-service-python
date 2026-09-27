@@ -14,12 +14,13 @@ router = APIRouter(prefix="/chain", tags=["chain"])
 @router.post("/events")
 def ingest_event(req: ChainEventIn, principal=Depends(get_principal),
                  service=Depends(get_service)):
-    # 宽松入模后归一化：缺字段/非法金额/非法类型在此分类报错，不透底层异常。
+    # 宽松入模后归一化：缺字段/非法金额/非法类型/非法资产在此分类报错，不透底层异常。
     event = normalize_event(req.model_dump())
     record = service.ingest_event(principal, event)
     return {
         "status": "ok",
         "key": list(record.event.natural_key),
+        "asset": record.event.asset,
         "event_status": record.status.value,
     }
 

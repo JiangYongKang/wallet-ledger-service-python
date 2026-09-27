@@ -1,17 +1,27 @@
 """领域类型：金额一律以最小货币单位的非负整数表示（避免浮点误差）。
 
+多资产
+------
+- 每个钱包地址下按资产（``asset``，归一化为大写币种标识）分别记账；不同资产
+  的可用/待入账/回撤平账口径完全独立，不能互相抵扣或串账。
+- 旧的、不携带资产信息的请求一律按 ``DEFAULT_ASSET`` 处理，结论与单资产时代一致。
+
 确认数语义：
 - 事件在 ``confirmations >= required`` 后达到最终性（CONFIRMED），金额计入
-  ``confirmed_balance``（可用余额）。
-- 未达到确认数的充值记为 PENDING，只计入 ``pending_in``，与可用余额分开。
-- REORGED 表示事件被链重组回撤：若金额已计入可用余额则扣回（不足部分计入
-  reorg_debt，资金平账到系统损失汇账户），不得使余额为负。
+  对应资产的 ``available``（可用余额）。
+- 未达到确认数的充值记为 PENDING，只计入该资产的 ``pending_in``，与可用分开。
+- REORGED 表示事件被链重组回撤：若金额已计入可用余额则扣回（不足部分计入该
+  资产的 reorg_debt，资金平账到系统损失汇账户），不得使该资产余额为负。
 """
 
 from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+
+# 未携带资产信息的旧请求（单资产时代）统一落账到该默认资产，
+# 使“不带 asset 的用法”与显式指定资产的新用法完全隔离但互不影响。
+DEFAULT_ASSET = "DEFAULT"
 
 # ---- 枚举 ----
 
@@ -56,6 +66,7 @@ class RawChainEvent:
     address: object = None
     amount: object = None
     block_height: object = None
+    asset: object = None  # 缺省 -> DEFAULT_ASSET（兼容单资产投喂）
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +79,11 @@ class ChainEvent:
     address: str
     amount: int  # 最小货币单位，正整数
     block_height: int
+    asset: str = DEFAULT_ASSET  # 归一化后的大写资产标识
 
     @property
     def natural_key(self) -> tuple[str, int]:
+        # 自然键仍是链上唯一定位 (tx_hash, log_index)；资产是该事件的固有属性。
         return self.tx_hash, self.log_index
 
 
@@ -99,14 +112,15 @@ class LedgerEntry:
     address: str
     amount: int
     ref_key: str  # 关联事件键或幂等键
+    asset: str = DEFAULT_ASSET  # 该笔变动所属资产，旧流水等价于默认资产
     memo: str = ""
 
 
 @dataclass(slots=True)
-class Balance:
-    """钱包余额视图。三个口径分别展示，不互相掩盖。"""
+class AssetBalance:
+    """单个钱包下单个资产的分口径余额。各资产互不相抵。"""
 
-    address: str
+    asset: str
     available: int = 0  # 可用余额：已最终性入账减去转出/提现/回撤扣回
     pending_in: int = 0  # 未达确认数的入账金额
     pending_out: int = 0  # 保留：尚未广播的链上提现在途（本期为 0）
@@ -114,12 +128,73 @@ class Balance:
 
     def to_dict(self) -> dict:
         return {
-            "address": self.address,
+            "asset": self.asset,
             "available": self.available,
             "pending_in": self.pending_in,
             "pending_out": self.pending_out,
             "reorg_debt": self.reorg_debt,
         }
+
+
+@dataclass(slots=True)
+class Balance:
+    """钱包余额视图：按资产分别持有分口径余额，不互相掩盖。
+
+    ``available`` / ``pending_in`` / ``pending_out`` / ``reorg_debt`` 为
+    默认资产（``DEFAULT_ASSET``）的便捷只读视图，保持单资产时代的访问方式。
+    """
+
+    address: str
+    assets: dict[str, AssetBalance] = field(default_factory=dict)
+
+    def get(self, asset: str = DEFAULT_ASSET) -> AssetBalance:
+        """取指定资产口径；从未发生过该资产变动时返回全 0 视图（不落空账）。"""
+        bal = self.assets.get(asset)
+        if bal is None:
+            bal = AssetBalance(asset=asset)
+        return bal
+
+    def ensure(self, asset: str = DEFAULT_ASSET) -> AssetBalance:
+        """惰性创建并落账该资产口径。"""
+        bal = self.assets.get(asset)
+        if bal is None:
+            bal = AssetBalance(asset=asset)
+            self.assets[asset] = bal
+        return bal
+
+    @property
+    def available(self) -> int:
+        return self.get().available
+
+    @property
+    def pending_in(self) -> int:
+        return self.get().pending_in
+
+    @property
+    def pending_out(self) -> int:
+        return self.get().pending_out
+
+    @property
+    def reorg_debt(self) -> int:
+        return self.get().reorg_debt
+
+    def to_dict(self, asset: str = DEFAULT_ASSET) -> dict:
+        """单资产口径视图（默认资产时保持与单资产时代完全相同的字段形状）。"""
+        bal = self.get(asset)
+        data = {
+            "address": self.address,
+            "available": bal.available,
+            "pending_in": bal.pending_in,
+            "pending_out": bal.pending_out,
+            "reorg_debt": bal.reorg_debt,
+        }
+        if asset != DEFAULT_ASSET:
+            data["asset"] = asset
+        return data
+
+    def assets_to_dict(self) -> dict:
+        """一次看清该钱包下每个资产各自的分口径余额。"""
+        return {asset: bal.to_dict() for asset, bal in sorted(self.assets.items())}
 
 
 # ---- 调用方身份与幂等记录 ----

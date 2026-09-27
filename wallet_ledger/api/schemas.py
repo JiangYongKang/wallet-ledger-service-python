@@ -2,6 +2,9 @@
 
 为保证错误可区分，归一化层自行校验，不依赖 pydantic 自动 422 暴露字段细节；
 链事件输入以宽松模型接收，再由 normalizer 归一化。
+
+``asset`` 在所有写接口上均可选：缺省时按默认资产处理，保持单资产时代的请求
+形状；显式给出时由 normalizer 统一归一化（大写 + 字符集/长度校验）。
 """
 
 from __future__ import annotations
@@ -16,16 +19,19 @@ class WalletCreateRequest(BaseModel):
 
 
 class TransferRequest(BaseModel):
+    # asset 宽松接收（类型非法也交归一化层报 INVALID_ASSET，不透 422 细节）
     from_address: str
     to_address: str
     amount: int  # 最小货币单位正整数
     idempotency_key: str = Field(min_length=1)
+    asset: Any | None = None  # 缺省 -> 默认资产
 
 
 class WithdrawRequest(BaseModel):
     address: str
     amount: int
     idempotency_key: str = Field(min_length=1)
+    asset: Any | None = None
 
 
 class ChainEventIn(BaseModel):
@@ -37,6 +43,7 @@ class ChainEventIn(BaseModel):
     address: Any | None = None
     amount: Any | None = None
     block_height: Any | None = None
+    asset: Any | None = None  # 缺省 -> 默认资产
 
 
 class ScanItem(BaseModel):

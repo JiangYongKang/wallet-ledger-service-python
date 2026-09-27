@@ -13,6 +13,7 @@ import threading
 from collections import defaultdict
 
 from .domain import (
+    DEFAULT_ASSET,
     Balance,
     ChainEventRecord,
     IdempotencyRecord,
@@ -91,6 +92,7 @@ class LedgerRepository:
         address: str,
         amount: int,
         ref_key: str,
+        asset: str = DEFAULT_ASSET,
         memo: str = "",
     ) -> LedgerEntry:
         with self._meta_lock:
@@ -101,15 +103,21 @@ class LedgerRepository:
                 address=address,
                 amount=amount,
                 ref_key=ref_key,
+                asset=asset,
                 memo=memo,
             )
             self._entries.append(entry)
             return entry
 
-    def list_entries(self, address: str | None = None) -> list[LedgerEntry]:
-        if address is None:
-            return list(self._entries)
-        return [e for e in self._entries if e.address == address]
+    def list_entries(
+        self, address: str | None = None, asset: str | None = None
+    ) -> list[LedgerEntry]:
+        return [
+            e
+            for e in self._entries
+            if (address is None or e.address == address)
+            and (asset is None or e.asset == asset)
+        ]
 
     # ---- 幂等 ----
 

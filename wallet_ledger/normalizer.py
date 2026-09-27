@@ -2,15 +2,21 @@
 
 金额接受十进制正整数字符串或整数（最小货币单位）；
 禁止小数/浮点/非数字/零/负数，避免浮点误差与非法金额混入。
+
+资产标识（asset）可选：缺省/空串按默认资产 ``DEFAULT`` 处理（兼容单资产请求）；
+显式给出时去除空白并统一大写，仅允许字母/数字/``-``/``_`` 且长度受限，
+防止“同一币种不同写法”造成串账与无界资源占用。
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from .domain import ChainEvent, ChainEventType, RawChainEvent
+from .domain import DEFAULT_ASSET, ChainEvent, ChainEventType, RawChainEvent
 from .errors import (
     InvalidAmountError,
+    InvalidAssetError,
     InvalidEventError,
     MissingFieldError,
 )
@@ -23,6 +29,9 @@ _REQUIRED_FIELDS = (
     "amount",
     "block_height",
 )
+
+# 资产标识：字母/数字开头，允许字母、数字、-、_，最长 16。
+_ASSET_RE = re.compile(r"[A-Z0-9][A-Z0-9_-]{0,15}")
 
 
 def normalize_event(raw: RawChainEvent | dict[str, Any]) -> ChainEvent:
@@ -61,6 +70,7 @@ def normalize_event(raw: RawChainEvent | dict[str, Any]) -> ChainEvent:
                                 details={"field": "address"})
 
     amount = parse_amount(data["amount"])
+    asset = normalize_asset(data.get("asset"))
 
     return ChainEvent(
         tx_hash=tx_hash.strip(),
@@ -69,7 +79,26 @@ def normalize_event(raw: RawChainEvent | dict[str, Any]) -> ChainEvent:
         address=address.strip(),
         amount=amount,
         block_height=block_height,
+        asset=asset,
     )
+
+
+def normalize_asset(value: Any) -> str:
+    """资产标识归一化：None/空串 -> DEFAULT_ASSET；否则大写并校验字符集。"""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return DEFAULT_ASSET
+    if not isinstance(value, str):
+        raise InvalidAssetError(
+            "asset must be a string identifier",
+            details={"value": str(value)},
+        )
+    asset = value.strip().upper()
+    if not _ASSET_RE.fullmatch(asset):
+        raise InvalidAssetError(
+            "asset must be 1-16 chars of letters/digits/-/_",
+            details={"value": value},
+        )
+    return asset
 
 
 def parse_amount(value: Any) -> int:
