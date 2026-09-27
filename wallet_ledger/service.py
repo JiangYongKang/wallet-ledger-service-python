@@ -1,5 +1,12 @@
 """账本领域服务：资金结论的唯一权威来源。
 
+多资产
+------
+- 所有资金变动按 ``(钱包地址, 资产)`` 落账；请求不带资产时按 ``DEFAULT_ASSET``
+  处理，旧的单资产用法不受影响。
+- 不同资产有独立的余额桶与流水标记，互不抵扣、互不串账；同一钱包锁下串行，
+  并发操作不同资产不会丢更新或半更新。
+
 并发与一致性
 ------------
 - 每个钱包地址一把 RLock；跨钱包写操作按地址排序后依次加锁，避免死锁。
@@ -11,8 +18,8 @@
 同一批次（或并发同时到达）里，确认与回撤都到达时：先统一执行回撤，
 再执行确认。已回撤事件上的确认一律忽略，因此结论唯一可复现。
 
-资金守恒
---------
+资金守恒（按资产分别成立）
+--------------------------
 - DEPOSIT 进入 pending_in；确认时从 pending_in 转入 available。
 - 回撤：先退 pending_in；若已确认，则从 available 扣回，available 不足部分
   计入 ``reorg_debt``（系统损失汇账户），available 被钳制为 0，永不为负，
@@ -36,6 +43,7 @@ from .domain import (
     LedgerTxnType,
     Principal,
     PrincipalRole,
+    WalletBalance,
 )
 from .errors import (
     DuplicateEventError,
@@ -44,7 +52,7 @@ from .errors import (
     ResourceNotFoundError,
 )
 from .idempotency import namespaced_key, request_fingerprint
-from .normalizer import parse_amount
+from .normalizer import normalize_asset, parse_amount
 from .repository import LedgerRepository
 from .security import authorize_wallet, require_role
 
@@ -82,7 +90,6 @@ class LedgerService:
             raise ResourceNotFoundError("wallet not found",
                                         details={"address": address})
         return bal
-
     # ------------------------------------------------------------------ #
     # 幂等
     # ------------------------------------------------------------------ #
@@ -132,13 +139,33 @@ class LedgerService:
         log.info("wallet ensured address=%s owner=%s", address, principal.principal_id)
         return bal
 
-    def get_balance(self, principal: Principal, address: str) -> Balance:
-        bal = self._authorized_wallet(principal, address)
+    def get_balance(
+        self, principal: Principal, address: str, asset: str | None = None
+    ) -> Balance:
+        """单资产余额视图；``asset=None`` 时返回默认资产（兼容旧用法）。"""
+        symbol = normalize_asset(asset)
+        self._authorized_wallet(principal, address)
+        bal = self.repo.get_balance(address, symbol)
+        if bal is None:
+            # 钱包存在但该资产尚无账本：返回零值视图（不创建，避免查询放大状态）。
+            bal = Balance(address=address, asset=symbol)
         log.info(
-            "balance query address=%s available=%d pending_in=%d reorg_debt=%d",
-            address, bal.available, bal.pending_in, bal.reorg_debt,
+            "balance query address=%s asset=%s available=%d pending_in=%d reorg_debt=%d",
+            address, symbol, bal.available, bal.pending_in, bal.reorg_debt,
         )
         return bal
+
+    def get_wallet_balance(self, principal: Principal, address: str) -> WalletBalance:
+        """钱包级视图：一次返回每个资产各自的分口径余额。"""
+        self._authorized_wallet(principal, address)
+        view = WalletBalance(address=address,
+                             assets=self.repo.get_asset_balances(address))
+        log.info(
+            "wallet balance query address=%s assets=%s",
+            address,
+            {a: b.available for a, b in sorted(view.assets.items())},
+        )
+        return view
 
     # ------------------------------------------------------------------ #
     # 链上事件投喂（INDEXER）
@@ -161,22 +188,24 @@ class LedgerService:
                 )
 
             if event.type is ChainEventType.WITHDRAWAL:
-                # 链上转出事件：观察即从可用余额冻结/扣减（模拟链已确认扣款）。
-                bal = self.repo.get_balance(event.address)
-                assert bal is not None
+                # 链上转出事件：观察即从可用余额扣减（模拟链已确认扣款）。
+                # confirmed=True 表示扣款已生效；finalized 仍由确认数推进，
+                # 未达最终性深度前可被重组回撤（钱退回可用余额）。
+                bal = self.repo.ensure_balance(event.address, event.asset)
                 record = ChainEventRecord(
                     event=event, status=EventStatus.CONFIRMED,
                     seen_height=event.block_height,
-                    confirmations=2**31 - 1, confirmed=True, finalized=True,
+                    confirmations=0, confirmed=True, finalized=False,
                 )
                 self.repo.put_event_if_absent(record)
                 self._debit_available(
                     bal, event.amount, LedgerTxnType.WITHDRAW_OUT,
                     ref_key=f"{event.tx_hash}:{event.log_index}",
                     memo="on-chain withdrawal observed",
+                    asset=event.asset,
                 )
-                log.info("withdrawal event applied address=%s amount=%d key=%s",
-                         event.address, event.amount, key)
+                log.info("withdrawal event applied address=%s asset=%s amount=%d key=%s",
+                         event.address, event.asset, event.amount, key)
                 return record
 
             record = ChainEventRecord(
@@ -185,17 +214,17 @@ class LedgerService:
             )
             stored = self.repo.put_event_if_absent(record)
             if stored is record:
-                bal = self.repo.get_balance(event.address)
-                assert bal is not None
+                bal = self.repo.ensure_balance(event.address, event.asset)
                 bal.pending_in += event.amount
                 self.repo.append_entry(
                     LedgerTxnType.DEPOSIT_PENDING, event.address, event.amount,
                     ref_key=f"{event.tx_hash}:{event.log_index}",
                     memo=f"deposit observed @height={event.block_height}",
+                    asset=event.asset,
                 )
                 log.info(
-                    "deposit pending address=%s amount=%d key=%s pending_in=%d",
-                    event.address, event.amount, key, bal.pending_in,
+                    "deposit pending address=%s asset=%s amount=%d key=%s pending_in=%d",
+                    event.address, event.asset, event.amount, key, bal.pending_in,
                 )
             return stored
 
@@ -272,7 +301,7 @@ class LedgerService:
 
     def _confirm_deposit(self, record: ChainEventRecord) -> None:
         event = record.event
-        bal = self.repo.get_balance(event.address)
+        bal = self.repo.get_balance(event.address, event.asset)
         assert bal is not None
         record.confirmed = True
         record.status = EventStatus.CONFIRMED
@@ -283,15 +312,17 @@ class LedgerService:
             LedgerTxnType.DEPOSIT_CONFIRM, event.address, event.amount,
             ref_key=f"{event.tx_hash}:{event.log_index}",
             memo=f"confirmations={record.confirmations} reached finality",
+            asset=event.asset,
         )
         log.info(
-            "deposit confirmed key=%s address=%s amount=%d available=%d",
-            event.natural_key, event.address, event.amount, bal.available,
+            "deposit confirmed key=%s address=%s asset=%s amount=%d available=%d",
+            event.natural_key, event.address, event.asset,
+            event.amount, bal.available,
         )
 
     def _reorg_record(self, record: ChainEventRecord, detached_height: int) -> None:
         event = record.event
-        bal = self.repo.get_balance(event.address)
+        bal = self.repo.get_balance(event.address, event.asset)
         assert bal is not None
         record.reorged = True
         record.status = EventStatus.REORGED
@@ -303,9 +334,10 @@ class LedgerService:
             self.repo.append_entry(
                 LedgerTxnType.REORG_CLAWBACK, event.address, event.amount,
                 ref_key=ref, memo="withdrawal reorged, funds returned",
+                asset=event.asset,
             )
-            log.info("withdrawal reorged funds-returned key=%s amount=%d",
-                     event.natural_key, event.amount)
+            log.info("withdrawal reorged funds-returned key=%s asset=%s amount=%d",
+                     event.natural_key, event.asset, event.amount)
             return
 
         # 充值回撤
@@ -324,20 +356,55 @@ class LedgerService:
                 self.repo.append_entry(
                     LedgerTxnType.REORG_CLAWBACK, LOSS_SINK, shortfall,
                     ref_key=ref, memo="clawback shortfall booked to loss sink",
+                    asset=event.asset,
                 )
                 log.warning(
-                    "clawback shortfall key=%s shortfall=%d reorg_debt=%d",
-                    event.natural_key, shortfall, bal.reorg_debt,
+                    "clawback shortfall key=%s asset=%s shortfall=%d reorg_debt=%d",
+                    event.natural_key, event.asset, shortfall, bal.reorg_debt,
                 )
             memo = "confirmed deposit reorged and clawed back"
         self.repo.append_entry(
             LedgerTxnType.REORG_CLAWBACK, event.address, event.amount,
             ref_key=ref, memo=memo,
+            asset=event.asset,
         )
         log.info(
-            "deposit reorged key=%s address=%s amount=%d available=%d pending_in=%d",
-            event.natural_key, event.address, event.amount,
+            "deposit reorged key=%s address=%s asset=%s amount=%d available=%d pending_in=%d",
+            event.natural_key, event.address, event.asset, event.amount,
             bal.available, bal.pending_in,
+        )
+
+    def _debit_available(
+        self,
+        bal: Balance,
+        amount: int,
+        txn_type: LedgerTxnType,
+        ref_key: str,
+        memo: str,
+        asset: str,
+    ) -> None:
+        """链上事件扣款：从指定资产可用余额扣回；不足部分计入 reorg_debt 平账。
+
+        与用户主动转账/提现不同，链上事件是既成事实（不能拒绝），因此余额永不为负，
+        缺口落到系统损失汇账户，维持该资产上的资金守恒。
+        """
+        bal.available -= amount
+        if bal.available < 0:
+            shortfall = -bal.available
+            bal.reorg_debt += shortfall
+            bal.available = 0
+            self.repo.append_entry(
+                LedgerTxnType.REORG_CLAWBACK, LOSS_SINK, shortfall,
+                ref_key=ref_key, memo="on-chain debit shortfall booked to loss sink",
+                asset=asset,
+            )
+            log.warning(
+                "on-chain debit shortfall address=%s asset=%s shortfall=%d reorg_debt=%d",
+                bal.address, asset, shortfall, bal.reorg_debt,
+            )
+        self.repo.append_entry(
+            txn_type, bal.address, amount,
+            ref_key=ref_key, memo=memo, asset=asset,
         )
 
     # ------------------------------------------------------------------ #
@@ -351,51 +418,65 @@ class LedgerService:
         to_address: str,
         amount: int,
         idempotency_key: str,
+        asset: str | None = None,
     ) -> dict:
         amount = self._check_amount(amount)
+        symbol = normalize_asset(asset)
         self._authorized_wallet(principal, from_address)
         # 收款方若不在调用者钱包范围内：为不泄露存在性，对越权目标统一 404。
         authorize_wallet(principal, to_address)
-        if self.repo.get_balance(to_address) is None:
+        if not self.repo.wallet_exists(to_address):
             raise ResourceNotFoundError("wallet not found",
                                         details={"address": to_address})
         payload = {
             "op": "transfer", "from": from_address, "to": to_address,
             "amount": amount, "idempotency_key": idempotency_key,
+            "asset": symbol,
         }
         with self._locked(from_address, to_address):
             existing = self._idempotency_begin(principal, idempotency_key, payload)
             if existing is not None:
                 return {**existing.body, "replay": True}
-            src = self.repo.get_balance(from_address)
-            dst = self.repo.get_balance(to_address)
-            assert src is not None and dst is not None
+            src = self.repo.get_balance(from_address, symbol)
+            if src is None:
+                # 付款方钱包存在但该资产无账本：余额视为 0，直接走不足拒绝。
+                src = self.repo.ensure_balance(from_address, symbol)
+            dst = self.repo.ensure_balance(to_address, symbol)
             if src.available < amount:
-                log.warning("transfer rejected insufficient funds %s -> %s have=%d need=%d",
-                            from_address, to_address, src.available, amount)
+                log.warning("transfer rejected insufficient funds %s -> %s asset=%s have=%d need=%d",
+                            from_address, to_address, symbol, src.available, amount)
                 raise InsufficientFundsError(
                     "available balance insufficient",
-                    details={"available": src.available, "requested": amount},
+                    details={
+                        "asset": symbol,
+                        "available": src.available, "requested": amount,
+                    },
                 )
             src.available -= amount
             dst.available += amount
             self.repo.append_entry(
                 LedgerTxnType.TRANSFER_OUT, from_address, amount,
-                ref_key=f"idem:{idempotency_key}", memo=f"transfer to {to_address}",
+                ref_key=f"idem:{idempotency_key}",
+                memo=f"transfer {symbol} to {to_address}", asset=symbol,
             )
             self.repo.append_entry(
                 LedgerTxnType.TRANSFER_IN, to_address, amount,
-                ref_key=f"idem:{idempotency_key}", memo=f"transfer from {from_address}",
+                ref_key=f"idem:{idempotency_key}",
+                memo=f"transfer {symbol} from {from_address}", asset=symbol,
             )
             body = {
                 "status": "ok", "op": "transfer",
-                "from": from_address, "to": to_address, "amount": amount,
-                "balances": {from_address: src.available, to_address: dst.available},
+                "from": from_address, "to": to_address,
+                "amount": amount, "asset": symbol,
+                "balances": {
+                    from_address: src.available, to_address: dst.available,
+                },
             }
             self._idempotency_commit(
                 principal, idempotency_key, payload, 200, body
             )
-            log.info("transfer ok %s -> %s amount=%d", from_address, to_address, amount)
+            log.info("transfer ok %s -> %s asset=%s amount=%d",
+                     from_address, to_address, symbol, amount)
             return body
 
     def withdraw(
@@ -404,46 +485,60 @@ class LedgerService:
         address: str,
         amount: int,
         idempotency_key: str,
+        asset: str | None = None,
     ) -> dict:
         amount = self._check_amount(amount)
+        symbol = normalize_asset(asset)
         self._authorized_wallet(principal, address)
         payload = {
             "op": "withdraw", "address": address,
             "amount": amount, "idempotency_key": idempotency_key,
+            "asset": symbol,
         }
         with self._locked(address):
             existing = self._idempotency_begin(principal, idempotency_key, payload)
             if existing is not None:
                 return {**existing.body, "replay": True}
-            bal = self.repo.get_balance(address)
-            assert bal is not None
+            bal = self.repo.get_balance(address, symbol)
+            if bal is None:
+                bal = self.repo.ensure_balance(address, symbol)
             if bal.available < amount:
-                log.warning("withdraw rejected insufficient funds address=%s have=%d need=%d",
-                            address, bal.available, amount)
+                log.warning("withdraw rejected insufficient funds address=%s asset=%s have=%d need=%d",
+                            address, symbol, bal.available, amount)
                 raise InsufficientFundsError(
                     "available balance insufficient",
-                    details={"available": bal.available, "requested": amount},
+                    details={
+                        "asset": symbol,
+                        "available": bal.available, "requested": amount,
+                    },
                 )
             bal.available -= amount
             self.repo.append_entry(
                 LedgerTxnType.WITHDRAW_OUT, address, amount,
-                ref_key=f"idem:{idempotency_key}", memo="off-chain withdraw",
+                ref_key=f"idem:{idempotency_key}",
+                memo=f"off-chain withdraw {symbol}", asset=symbol,
             )
             body = {
                 "status": "ok", "op": "withdraw",
-                "address": address, "amount": amount,
+                "address": address, "amount": amount, "asset": symbol,
                 "available": bal.available,
             }
             self._idempotency_commit(principal, idempotency_key, payload, 200, body)
-            log.info("withdraw ok address=%s amount=%d available=%d",
-                     address, amount, bal.available)
+            log.info("withdraw ok address=%s asset=%s amount=%d available=%d",
+                     address, symbol, amount, bal.available)
             return body
 
     # ------------------------------------------------------------------ #
 
-    def list_entries(self, principal: Principal, address: str) -> list[LedgerEntry]:
+    def list_entries(
+        self,
+        principal: Principal,
+        address: str,
+        asset: str | None = None,
+    ) -> list[LedgerEntry]:
         self._authorized_wallet(principal, address)
-        return self.repo.list_entries(address)
+        symbol = normalize_asset(asset) if asset is not None else None
+        return self.repo.list_entries(address, asset=symbol)
 
     @staticmethod
     def _check_amount(amount: int) -> int:

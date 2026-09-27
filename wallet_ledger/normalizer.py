@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from .domain import ChainEvent, ChainEventType, RawChainEvent
+from .domain import DEFAULT_ASSET, ChainEvent, ChainEventType, RawChainEvent
 from .errors import (
     InvalidAmountError,
+    InvalidAssetError,
     InvalidEventError,
     MissingFieldError,
 )
@@ -61,6 +63,7 @@ def normalize_event(raw: RawChainEvent | dict[str, Any]) -> ChainEvent:
                                 details={"field": "address"})
 
     amount = parse_amount(data["amount"])
+    asset = normalize_asset(data.get("asset"))
 
     return ChainEvent(
         tx_hash=tx_hash.strip(),
@@ -69,7 +72,31 @@ def normalize_event(raw: RawChainEvent | dict[str, Any]) -> ChainEvent:
         address=address.strip(),
         amount=amount,
         block_height=block_height,
+        asset=asset,
     )
+
+
+# 资产符号：字母数字开头，可含 . _ -，最长 32；统一大写，避免大小写串账。
+_ASSET_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
+
+
+def normalize_asset(value: Any) -> str:
+    """资产符号归一化：缺省（None）-> DEFAULT_ASSET；非法 -> InvalidAssetError。
+
+    字符串去空白并统一大写，保证 ``btc``/``BTC`` 落到同一资产桶。
+    """
+    if value is None:
+        return DEFAULT_ASSET
+    if not isinstance(value, str):
+        raise InvalidAssetError("asset must be a string",
+                                details={"value": str(value)})
+    symbol = value.strip().upper()
+    if not symbol or not _ASSET_RE.match(symbol):
+        raise InvalidAssetError(
+            "asset must be 1-32 chars of [A-Z0-9._-], starting alphanumeric",
+            details={"value": value},
+        )
+    return symbol
 
 
 def parse_amount(value: Any) -> int:

@@ -20,12 +20,15 @@ class TransferRequest(BaseModel):
     to_address: str
     amount: int  # 最小货币单位正整数
     idempotency_key: str = Field(min_length=1)
+    # 缺省/为 None 时按默认资产记账（兼容旧的单资产请求）。
+    asset: str | None = None
 
 
 class WithdrawRequest(BaseModel):
     address: str
     amount: int
     idempotency_key: str = Field(min_length=1)
+    asset: str | None = None
 
 
 class ChainEventIn(BaseModel):
@@ -37,6 +40,7 @@ class ChainEventIn(BaseModel):
     address: Any | None = None
     amount: Any | None = None
     block_height: Any | None = None
+    asset: Any | None = None  # 缺省 -> 默认资产
 
 
 class ScanItem(BaseModel):

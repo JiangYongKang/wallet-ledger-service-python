@@ -48,6 +48,12 @@ class InvalidEventError(ValidationError):
     code = "INVALID_EVENT"
 
 
+class InvalidAssetError(ValidationError):
+    """资产符号非法（空串、非法字符、超长、非字符串）。"""
+
+    code = "INVALID_ASSET"
+
+
 class OutOfOrderError(LedgerError):
     """事件/扫描高度乱序（不静默丢弃，显式拒绝）。"""
 

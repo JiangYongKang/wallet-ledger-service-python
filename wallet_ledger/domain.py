@@ -1,5 +1,9 @@
 """领域类型：金额一律以最小货币单位的非负整数表示（避免浮点误差）。
 
+多资产语义：
+- 账本按 ``(钱包地址, 资产)`` 维度记账，不同资产之间不互相抵扣、不串账。
+- 请求不带资产信息时按 ``DEFAULT_ASSET`` 处理，兼容旧的单资产用法。
+
 确认数语义：
 - 事件在 ``confirmations >= required`` 后达到最终性（CONFIRMED），金额计入
   ``confirmed_balance``（可用余额）。
@@ -12,6 +16,9 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+
+#: 未携带资产信息的请求落到的默认资产（兼容单资产用法）。
+DEFAULT_ASSET = "COIN"
 
 # ---- 枚举 ----
 
@@ -56,6 +63,7 @@ class RawChainEvent:
     address: object = None
     amount: object = None
     block_height: object = None
+    asset: object = None  # 缺省时按 DEFAULT_ASSET 处理
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +76,7 @@ class ChainEvent:
     address: str
     amount: int  # 最小货币单位，正整数
     block_height: int
+    asset: str = DEFAULT_ASSET
 
     @property
     def natural_key(self) -> tuple[str, int]:
@@ -92,7 +101,7 @@ class ChainEventRecord:
 
 @dataclass(slots=True)
 class LedgerEntry:
-    """一笔资金流水（只追加，不改写）。"""
+    """一笔资金流水（只追加不改写）。"""
 
     seq: int
     txn_type: LedgerTxnType
@@ -100,25 +109,44 @@ class LedgerEntry:
     amount: int
     ref_key: str  # 关联事件键或幂等键
     memo: str = ""
+    asset: str = DEFAULT_ASSET
 
 
 @dataclass(slots=True)
 class Balance:
-    """钱包余额视图。三个口径分别展示，不互相掩盖。"""
+    """单个 ``(钱包, 资产)`` 的余额视图。三个口径分别展示，不互相掩盖。"""
 
     address: str
+    asset: str = DEFAULT_ASSET
     available: int = 0  # 可用余额：已最终性入账减去转出/提现/回撤扣回
     pending_in: int = 0  # 未达确认数的入账金额
     pending_out: int = 0  # 保留：尚未广播的链上提现在途（本期为 0）
     reorg_debt: int = 0  # 回撤时可用不足而平账到损失汇账户的累计额
 
     def to_dict(self) -> dict:
+        # 保持旧版五键结构不变（单资产兼容）；资产维度由 WalletBalance 视图给出。
         return {
             "address": self.address,
             "available": self.available,
             "pending_in": self.pending_in,
             "pending_out": self.pending_out,
             "reorg_debt": self.reorg_debt,
+        }
+
+
+@dataclass(slots=True)
+class WalletBalance:
+    """一个钱包下全部资产的余额汇总视图（一次看清每个资产各自口径）。"""
+
+    address: str
+    assets: dict[str, Balance] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        # 顶层字段保持旧版结构（默认资产口径），``assets`` 给出每个资产的分口径。
+        default = self.assets.get(DEFAULT_ASSET, Balance(address=self.address))
+        return {
+            **default.to_dict(),
+            "assets": {asset: bal.to_dict() for asset, bal in sorted(self.assets.items())},
         }
 
 
