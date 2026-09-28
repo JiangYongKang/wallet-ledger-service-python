@@ -8,8 +8,12 @@
 - 事件在 ``confirmations >= required`` 后达到最终性（CONFIRMED），金额计入
   ``confirmed_balance``（可用余额）。
 - 未达到确认数的充值记为 PENDING，只计入 ``pending_in``，与可用余额分开。
-- REORGED 表示事件被链重组回撤：若金额已计入可用余额则扣回（不足部分计入
-  reorg_debt，资金平账到系统损失汇账户），不得使余额为负。
+- REORGED 表示事件被链重组回撤：
+  充值事件若金额已计入可用余额则扣回（不足部分计入 reorg_debt，资金平账到
+  系统损失汇账户），不得使余额为负；
+  链上转出事件则恢复到转出发生之前——只退回当初真正从可用余额扣掉的部分
+  （``debited_amount``），当初因可用不足而记下的缺口（``shortfall_amount``）
+  一并从 reorg_debt 冲销，既不负余额，也不虚增可用。
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ class LedgerTxnType(str, enum.Enum):
     DEPOSIT_PENDING = "deposit_pending"  # 入账登记（资金来源=链）
     DEPOSIT_CONFIRM = "deposit_confirm"  # 确认：待入账 -> 可用
     REORG_CLAWBACK = "reorg_clawback"  # 重组回撤
+    REORG_SHORTFALL_REVERSAL = "reorg_shortfall_reversal"  # 回撤时冲销损失汇缺口
     TRANSFER_OUT = "transfer_out"  # 钱包内转出（即时扣可用）
     TRANSFER_IN = "transfer_in"  # 钱包内转入
     WITHDRAW_OUT = "withdraw_out"  # 提现（即时扣可用）
@@ -97,6 +102,10 @@ class ChainEventRecord:
     confirmed: bool = False  # 是否已经把确认入账（幂等闸门）
     reorged: bool = False  # 是否已经回撤（幂等闸门）
     finalized: bool = False
+    #: 链上转出事件发生时，真正从可用余额扣掉的金额（余额被钳到 0 前的部分）。
+    debited_amount: int = 0
+    #: 链上转出事件发生时，因可用不足而平账到 reorg_debt 的缺口。
+    shortfall_amount: int = 0
 
 
 @dataclass(slots=True)
