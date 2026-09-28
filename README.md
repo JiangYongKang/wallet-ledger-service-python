@@ -81,7 +81,8 @@ curl -s "$H" 'localhost:8000/wallets/wA/balance?asset=BTC'   # 只看 BTC
   FINALIZED`；某资产事件达到最终性后不可回撤，不影响同钱包其他资产的回撤。
 - **回退平账按资产独立**：已确认充值回撤只扣该资产 `available`，不足部分计入
   **该资产** 的 `reorg_debt` 并追加带资产标记的 `@loss-sink` 流水；任何资产
-  余额都不会为负。链上转出事件被回撤时，钱只退回原资产。
+  余额都不会为负。链上转出事件被回撤时，钱只退回原资产，且只退回当初真正从
+  可用余额扣掉的那部分（见“核心规则 §2”）。
 - **并发隔离**：仍按钱包地址加锁，同一钱包下不同资产的写操作在同一临界区串行，
   互不丢更新、无半更新；跨钱包转账仍按地址排序加锁避免死锁。
 - **容量**：扫描限流与批量上限按**事件条数**计算（令牌/在途/`max_batch_size`
@@ -120,7 +121,24 @@ curl -s "$H" 'localhost:8000/wallets/wA/balance?asset=BTC'   # 只看 BTC
 - 已确认充值回撤：从 `available` 扣回；若可用不足（钱已转出/提现），
   扣到 **0**，缺口计入 `reorg_debt` 并追加一条 `@loss-sink` 平账流水，
   **余额永不为负**，资金去向在流水里可解释。
+- **链上转出（提现）事件回撤：结论必须恢复到这笔转出发生之前**。链上转出在
+  观察到时是既成事实、不能拒绝：系统先按
+  `applied = min(amount, available)` 从该资产 `available` 实扣，不足部分
+  `shortfall = amount − applied` 计入该资产 `reorg_debt`（损失汇账户），
+  `available` 钳制为 0；两个拆分额随事件记录持久化
+  （`withdrawal_applied` / `withdrawal_shortfall`）。回撤时按这两个值**原样
+  反向冲销**：
+  - 只把 `applied` 退回该资产 `available`（当初真正被扣走的钱）；
+  - `shortfall` 从该资产 `reorg_debt` 冲减，并追加一条
+    `@loss-sink` 的反向平账流水（缺口从未占用过可用，绝不能退回 `available`，
+    否则等于凭空造钱）；
+  - 因此零余额地址上的链上转出被回撤后仍然是零余额，既不能转出也不能提现
+    凭空多出的钱；任一时点任何资产的 `available` / `reorg_debt` 都不为负。
+  - 回退只作用于转出事件对应的那个资产，不同资产互不抵扣、互不串账；
+    已回撤事件的全部流水（全量转出流水 + 损失汇记缺口流水）视为整组冲销，
+    分口径余额与流水可按未回撤事件重放对账，恒等式继续成立。
 - 回撤、确认、扫描都带幂等闸门（`confirmed/reorged/finalized`），重复投递安全。
+  重复回撤结论不变、不产生重复冲销流水；回撤之后再次到达的确认一律忽略。
 
 **资金守恒不变式（对每个资产分别成立）**：
 
@@ -215,9 +233,9 @@ tests/             重组回退 / 重复提交 / 越权 / 并发 / 归一化 / H
 ## 测试覆盖与验证方法
 
 ```bash
-uv run pytest                      # 全部 73 个用例（49 个单资产原用例 + 24 个多资产用例）
+uv run pytest                      # 全部 82 个用例（原 73 个用例 + 9 个链上转出回撤修复用例）
 uv run pytest -s                   # 打印每个判定的事件流水（INFO 日志）
-uv run pytest tests/test_reorg.py        # 重组/回撤/守恒/回撤优先
+uv run pytest tests/test_reorg.py        # 重组/回撤/守恒/回撤优先/链上转出回撤
 uv run pytest tests/test_idempotency.py  # 重复提交 / 语义冲突 / 键隔离
 uv run pytest tests/test_permissions.py  # 角色 / 越权 404 同构
 uv run pytest tests/test_concurrency.py  # 并发：恰好一次、不负、守恒
@@ -226,6 +244,20 @@ uv run pytest tests/test_normalizer.py   # 缺字段/非法金额/乱序/批量
 uv run pytest tests/test_http_integration.py  # 端到端 + 429 + 208 重放
 ```
 
+链上转出（提现）事件被链重组回撤的修复用例（`tests/test_reorg.py` 与
+`tests/test_multi_asset.py`）稳定复现并守护以下场景，任一资产都不允许负余额、
+凭空多出可用余额或留下对不平的账：
+
+- **可用充足时转出被回撤**：整笔实扣退回 `available`，无 `reorg_debt` 残留；
+- **可用不足（部分缺口）时转出被回撤**：只退回实扣部分，缺口从
+  `reorg_debt` 等额冲销并在 `@loss-sink` 留下反向流水，可用不被虚增；
+- **该资产零余额时转出被回撤**：回退后仍是零余额、零缺口，且不能再
+  转出/提现凭空得到的钱；
+- **重复回撤、回撤后再确认**：结论幂等不变、冲销流水恰好一条，确认被忽略；
+- **回撤与确认同批到达**：先回撤后确认、结论唯一可复现；
+- **多资产隔离**：某资产链上转出的扣款、缺口平账与回撤冲销只作用于本资产，
+  逐资产 `available − reorg_debt = 净外部注入` 守恒成立。
+
 多资产用例（`tests/test_multi_asset.py`）重点验证：
 
 - **独立记账**：BTC/ETH/COIN 的待入账、确认、转账、提现各自落桶，
@@ -233,7 +265,8 @@ uv run pytest tests/test_http_integration.py  # 端到端 + 429 + 208 重放
 - **独立守恒**：混合操作 + 回撤后，逐资产校验
   `Σavailable − Σreorg_debt = 净外部注入`；
 - **回退隔离**：某资产充值回撤只动本资产；缺口平账流水带资产标记；
-  链上转出事件的扣款、不足平账与回撤退款都只作用于原资产；
+  链上转出事件的扣款、不足平账与回撤退款/缺口冲销都只作用于原资产，
+  零余额/不足额转出被回撤不会凭空多出可用余额；
 - **幂等**：同键同资产 208 回放（含大小写归一）、同键换资产 409、
   自然键重复投喂 409、重复确认恰好一次；
 - **兼容**：不带资产的事件/转账/提现存到 COIN，HTTP 余额顶层字段不变；

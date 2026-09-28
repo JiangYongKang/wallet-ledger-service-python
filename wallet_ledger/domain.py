@@ -10,6 +10,11 @@
 - 未达到确认数的充值记为 PENDING，只计入 ``pending_in``，与可用余额分开。
 - REORGED 表示事件被链重组回撤：若金额已计入可用余额则扣回（不足部分计入
   reorg_debt，资金平账到系统损失汇账户），不得使余额为负。
+- 链上转出（提现）事件观察即按既成事实扣款：只从 available 实扣
+  ``min(amount, available)``，不足部分计入 reorg_debt；事件记录保存这一拆分
+  （withdrawal_applied / withdrawal_shortfall）。该事件被回撤时按拆分原样
+  反向冲销——只退回实扣部分、等额冲销缺口，结论恢复到转出发生之前，
+  绝不把缺口部分加回 available（否则凭空抬高可用余额）。
 """
 
 from __future__ import annotations
@@ -97,6 +102,12 @@ class ChainEventRecord:
     confirmed: bool = False  # 是否已经把确认入账（幂等闸门）
     reorged: bool = False  # 是否已经回撤（幂等闸门）
     finalized: bool = False
+    # 链上转出事件观察即扣款时的实际落账拆分（其余事件恒为 0）：
+    # applied = 当时真正从 available 扣掉的部分（<= 事件金额）
+    # shortfall = available 不足而计入 reorg_debt（损失汇账户）的部分
+    # 恒有 applied + shortfall == event.amount；回撤时按这两个值原样反向冲销。
+    withdrawal_applied: int = 0
+    withdrawal_shortfall: int = 0
 
 
 @dataclass(slots=True)

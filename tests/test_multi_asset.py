@@ -224,6 +224,93 @@ def test_onchain_withdrawal_shortfall_booked_on_same_asset(env):
     assert (coin.available, coin.reorg_debt) == (0, 0)
 
 
+def test_onchain_withdrawal_shortfall_reorg_restores_per_asset(env):
+    """不足额（含零余额）链上转出被回撤：只回本资产实扣部分、冲本资产缺口，
+    不碰其他资产，也不凭空抬高可用。"""
+    s, idx, alice = env["service"], env["indexer"], env["alice"]
+    rb = _deposit(s, idx, "tb", "wA", 100, 10, asset=BTC)
+    re_ = _deposit(s, idx, "te", "wA", 100, 10, asset=ETH)
+    _confirm(s, idx, rb)
+    _confirm(s, idx, re_)
+    s.withdraw(alice, "wA", 70, "off", asset=BTC)  # BTC 可用剩 30
+    # BTC：转出 100，实扣 30、缺口 70；COIN：零余额转出 60，实扣 0、缺口 60
+    w_btc = s.ingest_event(
+        idx, _event("wbtc", "wA", 100, 12, type_="withdrawal", asset=BTC))
+    w_coin = s.ingest_event(
+        idx, _event("wcoin", "wA", 60, 12, type_="withdrawal", asset=DEFAULT_ASSET))
+
+    assert (s.get_balance(alice, "wA", BTC).available,
+            s.get_balance(alice, "wA", BTC).reorg_debt) == (0, 70)
+    assert (s.get_balance(alice, "wA").available,
+            s.get_balance(alice, "wA").reorg_debt) == (0, 60)
+    assert s.get_balance(alice, "wA", ETH).available == 100
+
+    # 只回撤 BTC 的转出：退回实扣 30、冲掉 BTC 缺口 70；ETH/COIN 完全不动
+    s.apply_reorg(idx, [w_btc.event.natural_key], 13)
+    btc, eth, coin = (s.get_balance(alice, "wA", BTC),
+                      s.get_balance(alice, "wA", ETH),
+                      s.get_balance(alice, "wA"))
+    assert (btc.available, btc.pending_in, btc.reorg_debt) == (30, 0, 0)
+    assert (eth.available, eth.reorg_debt) == (100, 0)
+    assert (coin.available, coin.reorg_debt) == (0, 60)
+    # 损失汇冲销流水只打在 BTC 上
+    assert [e for e in s.repo.list_entries()
+            if e.address == "@loss-sink" and "reversed" in e.memo
+            and e.asset == BTC]
+    assert not [e for e in s.repo.list_entries()
+                if e.address == "@loss-sink" and "reversed" in e.memo
+                and e.asset in (ETH, DEFAULT_ASSET)]
+
+    # 再回撤零余额的 COIN 转出：仍然一分钱都没有，缺口冲销；BTC/ETH 不变
+    s.apply_reorg(idx, [w_coin.event.natural_key], 13)
+    coin = s.get_balance(alice, "wA")
+    assert (coin.available, coin.reorg_debt) == (0, 0)
+    btc, eth = s.get_balance(alice, "wA", BTC), s.get_balance(alice, "wA", ETH)
+    assert btc.available == 30 and eth.available == 100
+
+    # 逐资产守恒：available − reorg_debt == 净外部注入（按未回撤事件计算）
+    # BTC：确认 100、链外提现 70、链上转出已回撤（视为未发生）=> 30
+    # ETH：确认 100 => 100；COIN：无任何未回撤事件 => 0
+    assert btc.available - btc.reorg_debt == 30
+    assert eth.available - eth.reorg_debt == 100
+    assert coin.available - coin.reorg_debt == 0
+
+
+def test_onchain_withdrawal_reorg_same_batch_confirm_isolated_per_asset(env):
+    """同批回撤+确认到达链上转出：回撤优先、结论确定，且只作用本资产。"""
+    s, sc, idx, alice = (env["service"], env["scanner"],
+                         env["indexer"], env["alice"])
+    # COIN 零余额链上转出 80（缺口 80）；BTC 充值待确认 50
+    s.ingest_event(idx, _event("wc", "wA", 80, 12, type_="withdrawal"))
+    _deposit(s, idx, "tb", "wA", 50, 11, asset=BTC)
+
+    out = sc.scan_batch(
+        idx, tip_height=13,
+        events=[("wc", 0, 3), ("tb", 0, 3)],
+        reorg_keys=[("wc", 0)],
+    )
+    assert out["status"] == "ok"
+    coin = s.get_balance(alice, "wA")
+    btc = s.get_balance(alice, "wA", BTC)
+    # COIN 转出已回撤：零余额、零缺口，确认被忽略；BTC 同批正常确认
+    assert (coin.available, coin.pending_in, coin.reorg_debt) == (0, 0, 0)
+    assert (btc.available, btc.pending_in) == (50, 0)
+
+    # 整批重放：结论唯一可复现
+    sc.scan_batch(
+        idx, tip_height=13,
+        events=[("wc", 0, 3), ("tb", 0, 3)],
+        reorg_keys=[("wc", 0)],
+    )
+    coin2 = s.get_balance(alice, "wA")
+    btc2 = s.get_balance(alice, "wA", BTC)
+    assert (coin2.available, coin2.reorg_debt) == (0, 0)
+    assert (btc2.available, btc2.pending_in) == (50, 0)
+    # 回撤后的 COIN 地址上不能凭空提现
+    with pytest.raises(InsufficientFundsError):
+        s.withdraw(alice, "wA", 1, "phantom-coin")
+
+
 # ---- 幂等：重复 vs 语义冲突在资产维度上仍可区分 ----
 
 

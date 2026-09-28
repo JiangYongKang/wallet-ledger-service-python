@@ -24,6 +24,9 @@
 - 回撤：先退 pending_in；若已确认，则从 available 扣回，available 不足部分
   计入 ``reorg_debt``（系统损失汇账户），available 被钳制为 0，永不为负，
   账面对“外部已花出”的资金做了显式平账。
+- 链上转出（WITHDRAWAL）观察即扣款：实扣 ``min(amount, available)``，缺口计入
+  reorg_debt，拆分额记在事件上。其回撤只退回实扣额并等额冲销缺口，
+  恢复到转出之前；不会把整笔金额（含从未占用可用的缺口）加回 available。
 - 转出/提现即时扣 available，余额不足显式拒绝。
 """
 
@@ -197,16 +200,24 @@ class LedgerService:
                     seen_height=event.block_height,
                     confirmations=0, confirmed=True, finalized=False,
                 )
-                self.repo.put_event_if_absent(record)
-                self._debit_available(
+                stored = self.repo.put_event_if_absent(record)
+                applied, shortfall = self._debit_available(
                     bal, event.amount, LedgerTxnType.WITHDRAW_OUT,
                     ref_key=f"{event.tx_hash}:{event.log_index}",
                     memo="on-chain withdrawal observed",
                     asset=event.asset,
                 )
-                log.info("withdrawal event applied address=%s asset=%s amount=%d key=%s",
-                         event.address, event.asset, event.amount, key)
-                return record
+                # 记录当时的实际落账拆分：回撤时必须按它原样反向冲销，
+                # 不能把整笔事件金额都加回 available（缺口部分从未扣过可用）。
+                record.withdrawal_applied = applied
+                record.withdrawal_shortfall = shortfall
+                log.info(
+                    "withdrawal event applied address=%s asset=%s amount=%d "
+                    "debited=%d shortfall=%d key=%s",
+                    event.address, event.asset, event.amount,
+                    applied, shortfall, key,
+                )
+                return stored
 
             record = ChainEventRecord(
                 event=event, status=EventStatus.PENDING,
@@ -329,15 +340,35 @@ class LedgerService:
         ref = f"{event.tx_hash}:{event.log_index}"
 
         if event.type is ChainEventType.WITHDRAWAL:
-            # 链上转出事件被回撤：钱回到可用余额。
-            bal.available += event.amount
-            self.repo.append_entry(
-                LedgerTxnType.REORG_CLAWBACK, event.address, event.amount,
-                ref_key=ref, memo="withdrawal reorged, funds returned",
-                asset=event.asset,
+            # 链上转出事件被回撤：结论必须恢复到这笔转出发生之前。
+            # 只把当初真正从 available 扣掉的部分（applied）退回 available；
+            # 当初余额不足而平到 reorg_debt/损失汇账户的部分（shortfall）
+            # 从未占用过可用余额，必须同步反向冲销，绝不能加回 available，
+            # 否则等于凭空抬高可用余额。
+            applied = record.withdrawal_applied
+            shortfall = record.withdrawal_shortfall
+            if applied:
+                bal.available += applied
+                self.repo.append_entry(
+                    LedgerTxnType.REORG_CLAWBACK, event.address, applied,
+                    ref_key=ref,
+                    memo="withdrawal reorged, originally debited funds returned",
+                    asset=event.asset,
+                )
+            if shortfall:
+                bal.reorg_debt -= shortfall
+                self.repo.append_entry(
+                    LedgerTxnType.REORG_CLAWBACK, LOSS_SINK, shortfall,
+                    ref_key=ref,
+                    memo="withdrawal reorged, debit shortfall reversed from loss sink",
+                    asset=event.asset,
+                )
+            log.info(
+                "withdrawal reorged key=%s asset=%s amount=%d returned=%d "
+                "shortfall-reversed=%d available=%d reorg_debt=%d",
+                event.natural_key, event.asset, event.amount, applied,
+                shortfall, bal.available, bal.reorg_debt,
             )
-            log.info("withdrawal reorged funds-returned key=%s asset=%s amount=%d",
-                     event.natural_key, event.asset, event.amount)
             return
 
         # 充值回撤
@@ -382,17 +413,22 @@ class LedgerService:
         ref_key: str,
         memo: str,
         asset: str,
-    ) -> None:
+    ) -> tuple[int, int]:
         """链上事件扣款：从指定资产可用余额扣回；不足部分计入 reorg_debt 平账。
 
         与用户主动转账/提现不同，链上事件是既成事实（不能拒绝），因此余额永不为负，
         缺口落到系统损失汇账户，维持该资产上的资金守恒。
+
+        返回 ``(applied, shortfall)``：``applied`` 为真正从 available 扣掉的金额
+        （``min(amount, available)``），``shortfall`` 为可用不足而计入 reorg_debt
+        的缺口；恒有 ``applied + shortfall == amount``。事件被重组回撤时必须按这
+        两个值原样反向冲销，不能把整笔金额都退回 available。
         """
-        bal.available -= amount
-        if bal.available < 0:
-            shortfall = -bal.available
+        applied = min(amount, bal.available)
+        shortfall = amount - applied
+        bal.available -= applied
+        if shortfall:
             bal.reorg_debt += shortfall
-            bal.available = 0
             self.repo.append_entry(
                 LedgerTxnType.REORG_CLAWBACK, LOSS_SINK, shortfall,
                 ref_key=ref_key, memo="on-chain debit shortfall booked to loss sink",
@@ -406,6 +442,7 @@ class LedgerService:
             txn_type, bal.address, amount,
             ref_key=ref_key, memo=memo, asset=asset,
         )
+        return applied, shortfall
 
     # ------------------------------------------------------------------ #
     # 用户资金操作（幂等）
